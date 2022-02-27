@@ -1,10 +1,13 @@
+use std::fmt::Debug;
 use std::io::{Error, ErrorKind};
+use std::time::Duration;
 
-use async_std::{prelude::*, task};
+use async_std::{stream};
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
-use futures::TryFutureExt;
+use futures::future::join_all;
+use futures::StreamExt;
 use yahoo_finance_api as yahoo;
 
 #[derive(Parser, Debug)]
@@ -142,7 +145,7 @@ fn min(series: &[f64]) -> Option<f64> {
 
 #[async_trait]
 impl AsyncStockSignal for MinPrice {
-    type SignalType = (f64);
+    type SignalType = f64;
 
     async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
         min(series)
@@ -160,11 +163,10 @@ async fn fetch_closing_data(
     let provider = yahoo::YahooConnector::new();
 
     let response = provider
-        .get_quote_history(symbol, *beginning, *end).await;
-    // .map_err(|_| Error::from(ErrorKind::InvalidData));
-    let mut quotes = response.unwrap()
-        .quotes().unwrap();
-    // .map_err(|_| Error::from(ErrorKind::InvalidData));
+        .get_quote_history(symbol, *beginning, *end).await
+        .map_err(|_| Error::from(ErrorKind::InvalidData))?;
+    let mut quotes = response.quotes()
+        .map_err(|_| Error::from(ErrorKind::InvalidData))?;
     if !quotes.is_empty() {
         quotes.sort_by_cached_key(|k| k.timestamp);
         Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
@@ -178,34 +180,49 @@ async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let to = Utc::now();
+    let mut interval = stream::interval(Duration::from_secs(5));
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to).await?;
-        if !closes.is_empty() {
-            // min/max of the period. unwrap() because those are Option types
-            let period_max: f64 = MaxPrice {}.calculate(&closes).await.unwrap();
-            let period_min: f64 = MinPrice {}.calculate(&closes).await.unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
-            let (_, pct_change) = PriceDifference {}.calculate(&closes).await.unwrap_or((0.0, 0.0));
-            let wsm = WindowedSMA { window_size: 30 };
-            let sma = wsm.calculate(&closes).await.unwrap_or_default();
 
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
+
+    while let Some(_) = interval.next().await {
+        for symbol in opts.symbols.split(',') {
+            let _r = handle_data(&from, &to, &symbol).await;
         }
     }
     Ok(())
+}
+
+async fn handle_data(from: &DateTime<Utc>, to: &DateTime<Utc>, symbol: &str) -> Option<Vec<f64>> {
+    let closes = fetch_closing_data(&symbol, &from, &to).await.ok()?;
+    let last_price = *closes.last().unwrap_or(&0.0);
+    let wsm = WindowedSMA { window_size: 30 };
+
+
+    if !closes.is_empty() {
+        let (_, pct_change) = PriceDifference {}.calculate(&closes).await.unwrap_or((0.0, 0.0));
+        let sma = wsm.calculate(&closes).await.unwrap_or_default();
+        let res_compute =
+            join_all(
+                vec![
+                    MinPrice {}.calculate(&closes),
+                    MaxPrice {}.calculate(&closes),
+                ]).await;
+
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            from.to_rfc3339(),
+            symbol,
+            last_price,
+            pct_change * 100.0,
+            res_compute[0]?,
+            res_compute[1]?,
+            sma.last().unwrap_or(&0.0)
+        );
+    }
+    Some(closes)
 }
 
 #[cfg(test)]
